@@ -1,0 +1,90 @@
+'use client';
+import dynamic from 'next/dynamic';
+import { useEffect, useMemo, useState } from 'react';
+import { supabase } from '@/lib/supabaseClient';
+import { calculateRoadRoute, formatClock, heuristicOrder } from '@/lib/route';
+import type { CalculatedRoute, Destination, Driver, Passenger, Vehicle } from '@/lib/types';
+const RouteMap = dynamic(() => import('@/components/RouteMap'), { ssr: false });
+
+export default function Home() {
+  const [passengers, setPassengers] = useState<Passenger[]>([]);
+  const [destination, setDestination] = useState<Destination | null>(null);
+  const [vehicle, setVehicle] = useState<Vehicle | null>(null);
+  const [driver, setDriver] = useState<Driver | null>(null);
+  const [order, setOrder] = useState<Passenger[]>([]);
+  const [route, setRoute] = useState<CalculatedRoute | null>(null);
+  const [startTime, setStartTime] = useState('07:00');
+  const [loading, setLoading] = useState(true);
+  const [routing, setRouting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [dragIndex, setDragIndex] = useState<number | null>(null);
+
+  useEffect(() => {
+    (async () => {
+      const [{ data: p, error: pe }, { data: d }, { data: v }, { data: dr }] = await Promise.all([
+        supabase.from('passengers').select('*').order('full_name'),
+        supabase.from('destinations').select('*').limit(1),
+        supabase.from('vehicles').select('*').limit(1),
+        supabase.from('drivers').select('*').limit(1),
+      ]);
+      if (pe) setError(pe.message);
+      const pax = (p || []) as Passenger[];
+      const dest = (d?.[0] || null) as Destination | null;
+      setPassengers(pax); setDestination(dest); setVehicle(v?.[0] || null); setDriver(dr?.[0] || null);
+      if (dest) setOrder(heuristicOrder(pax, dest));
+      setLoading(false);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!destination || order.length === 0) return;
+    let cancelled = false;
+    setRouting(true); setError(null);
+    calculateRoadRoute(order, destination)
+      .then((r) => { if (!cancelled) setRoute(r); })
+      .catch((e) => { if (!cancelled) setError(e.message); })
+      .finally(() => { if (!cancelled) setRouting(false); });
+    return () => { cancelled = true; };
+  }, [order, destination]);
+
+  const etas = useMemo(() => {
+    if (!route) return [];
+    let elapsed = 0;
+    return route.legs.map((leg) => { elapsed += leg.travelTimeSeconds; return formatClock(startTime, elapsed); });
+  }, [route, startTime]);
+
+  const drop = (idx: number) => {
+    if (dragIndex === null || dragIndex === idx) return;
+    const next = [...order]; const [moved] = next.splice(dragIndex, 1); next.splice(idx, 0, moved);
+    setOrder(next); setDragIndex(null);
+  };
+
+  if (loading) return <div className="center">Yükleniyor…</div>;
+  if (!destination || !order.length) return <div className="center">Yolcu veya varış verisi bulunamadı.</div>;
+
+  const distanceKm = (route?.lengthMeters || 0) / 1000;
+  const durationMin = (route?.travelTimeSeconds || 0) / 60;
+  const delayMin = (route?.trafficDelaySeconds || 0) / 60;
+  const fuelL = distanceKm * 9 / 100;
+  const cost = fuelL * 45;
+
+  return <div className="app">
+    <header className="header"><div className="brand">🚐 ServisPilot AI v2</div><div className="header-right"><label className="time-input"><span>Başlangıç</span><input type="time" value={startTime} onChange={(e) => setStartTime(e.target.value)} /></label><div className="veh-info">{vehicle && `${vehicle.plate} · ${vehicle.model}`}{driver && ` · Şoför: ${driver.full_name}`}</div></div></header>
+    {error && <div className="error-banner">⚠️ {error}</div>}
+    <div className="layout"><aside className="sidebar">
+      <div className="card"><div className="card-title">Gerçek Yol Özeti</div>
+        <div className="stat-row"><span>Mesafe</span><b>{distanceKm.toFixed(1)} km</b></div>
+        <div className="stat-row"><span>Trafikli süre</span><b>{Math.round(durationMin)} dk</b></div>
+        <div className="stat-row"><span>Trafik gecikmesi</span><b>{Math.round(delayMin)} dk</b></div>
+        <div className="stat-row"><span>Yakıt</span><b>{fuelL.toFixed(1)} L</b></div>
+        <div className="stat-row"><span>Tahmini maliyet</span><b>{Math.round(cost)} TL</b></div>
+        <div className="stat-row"><span>Varış</span><b>{route ? formatClock(startTime, route.travelTimeSeconds) : '—'}</b></div>
+        <p className="hint">{routing ? 'TomTom gerçek yol ve trafik hesabı yapılıyor…' : 'Rota TomTom yol ağı ve canlı trafik ile hesaplandı.'}</p>
+      </div>
+      <div className="card"><div className="card-title">Yolcu Sıralaması</div><ul className="passenger-list">
+        {order.map((p, i) => <li key={p.id} draggable onDragStart={() => setDragIndex(i)} onDragOver={(e) => e.preventDefault()} onDrop={() => drop(i)} className="passenger-item"><span className="handle">☰</span><span className="num">{i + 1}</span><span className="name">{p.full_name}</span><span className="eta">{etas[i] || '—'}</span></li>)}
+        <li className="passenger-item dest"><span className="num">🏁</span><span className="name">{destination.name}</span><span className="eta">{route ? formatClock(startTime, route.travelTimeSeconds) : '—'}</span></li>
+      </ul><p className="hint">Sıralamayı sürükleyince gerçek rota yeniden hesaplanır.</p></div>
+    </aside><main className="map-area"><RouteMap passengers={order} destination={destination} route={route} /><div className="map-legend"><span><i className="line-blue" /> Gerçek rota</span><span>TomTom canlı trafik renkleri</span></div></main></div>
+  </div>;
+}
